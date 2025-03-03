@@ -1,0 +1,2 @@
+option('worker_count', type: 'integer', min: 1, value: 10)
+option('update_interval_us', type: 'integer', min: 0, value: 5)

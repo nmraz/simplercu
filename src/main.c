@@ -11,9 +11,6 @@
 
 #include "rcu.h"
 
-#define WORKER_COUNT 10
-#define UPDATE_INTERVAL_US 5
-
 atomic_bool should_exit;
 _Atomic(uint64_t*) global_shared_state;
 
@@ -78,7 +75,8 @@ int main(void) {
 
     update_global_state(1);
 
-    puts("starting stresstest");
+    printf("starting stresstest with %d workers, update interval %dμs\n",
+           WORKER_COUNT, UPDATE_INTERVAL_US);
 
     for (size_t i = 0; i < WORKER_COUNT; i++) {
         if (thrd_create(&workers[i], worker_func, (void*) (intptr_t) i) !=
