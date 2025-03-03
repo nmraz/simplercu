@@ -101,11 +101,14 @@ void rcu_thread_offline(void) {
 }
 
 void synchronize_rcu(void) {
+    uint32_t thread_count = 0;
     uint32_t quiescent = 0;
 
     mtx_lock(&global_state.gp_lock);
 
-    atomic_store_explicit(&global_state.gp_holdouts, global_state.thread_count,
+    thread_count = global_state.thread_count;
+
+    atomic_store_explicit(&global_state.gp_holdouts, thread_count,
                           memory_order_relaxed);
 
     // Barrier R: Synchronizes-with D.
@@ -159,8 +162,12 @@ void synchronize_rcu(void) {
                                   memory_order_relaxed);
     }
 
-    if (atomic_load_explicit(&global_state.gp_holdouts, memory_order_relaxed) >
-        0) {
+    if (quiescent != thread_count) {
+        // If we haven't reported all online threads as quiescent ourselves, we
+        // need to wait for at least one to report itself via
+        // `rcu_read_unlock_report_qs` and execute a matching memory barrier
+        // when it does.
+
         for (;;) {
             uint32_t holdouts = atomic_load_explicit(&global_state.gp_holdouts,
                                                      memory_order_relaxed);
