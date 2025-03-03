@@ -5,8 +5,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/time.h>
 #include <sys/user.h>
 #include <threads.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "rcu.h"
@@ -78,6 +80,9 @@ int main(void) {
     printf("starting stresstest with %d workers, update interval %dμs\n",
            WORKER_COUNT, UPDATE_INTERVAL_US);
 
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
     for (size_t i = 0; i < WORKER_COUNT; i++) {
         if (thrd_create(&workers[i], worker_func, (void*) (intptr_t) i) !=
             thrd_success) {
@@ -96,7 +101,14 @@ int main(void) {
         thrd_join(workers[i], NULL);
     }
 
-    puts("stresstest complete");
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &end);
+
+    uint64_t elapsed_us = (end.tv_sec - start.tv_sec) * 1000000 +
+                          (end.tv_nsec - start.tv_nsec) / 1000;
+
+    printf("stresstest complete in %lu.%02lus\n", elapsed_us / 1000000,
+           (elapsed_us % 1000000) / 10000);
 
     rcu_thread_offline();
 
