@@ -11,21 +11,17 @@
 
 #include "rcu.h"
 
-#define WORKER_COUNT 15
-
-struct shared_state {
-    uint64_t a;
-    uint64_t b;
-};
+#define WORKER_COUNT 10
+#define UPDATE_INTERVAL_US 5
 
 atomic_bool should_exit;
-_Atomic(struct shared_state*) global_shared_state;
+_Atomic(uint64_t*) global_shared_state;
 
-thread_local uint64_t final_sum;
 thread_local uint64_t iterations;
 
 int worker_func(void* arg) {
-    struct shared_state* state;
+    uint64_t* state;
+    uint64_t value;
     int i = (int) (intptr_t) arg;
 
     rcu_thread_online();
@@ -37,35 +33,37 @@ int worker_func(void* arg) {
         // compiler won't break the dependency here.
         state =
             atomic_load_explicit(&global_shared_state, memory_order_relaxed);
-        final_sum += state->a * state->b;
+        value = *state;
+
+        if (value == UINT64_MAX) {
+            abort();
+        }
+
         iterations++;
 
         rcu_read_unlock();
     }
 
-    printf("thread %d: sum %lu, iterations %lu\n", i, final_sum, iterations);
+    printf("thread %d: %lu iterations\n", i, iterations);
 
     rcu_thread_offline();
 
     return 0;
 }
 
-void update_global_state(uint64_t a, uint64_t b) {
-    struct shared_state* old_state =
+void update_global_state(uint64_t n) {
+    uint64_t* old_state =
         atomic_load_explicit(&global_shared_state, memory_order_relaxed);
 
-    struct shared_state* new_state =
-        mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
-             MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-    new_state->a = a;
-    new_state->b = b;
+    uint64_t* new_state = malloc(sizeof(*new_state));
+    *new_state = n;
 
     atomic_store_explicit(&global_shared_state, new_state,
                           memory_order_release);
 
     if (old_state) {
         synchronize_rcu();
-        munmap(old_state, PAGE_SIZE);
+        *old_state = UINT64_MAX;
     }
 }
 
@@ -78,7 +76,9 @@ int main(void) {
 
     rcu_thread_online();
 
-    update_global_state(1, 2);
+    update_global_state(1);
+
+    puts("starting stresstest");
 
     for (size_t i = 0; i < WORKER_COUNT; i++) {
         if (thrd_create(&workers[i], worker_func, (void*) (intptr_t) i) !=
@@ -87,10 +87,9 @@ int main(void) {
         }
     }
 
-    for (size_t i = 0; i < 10; i++) {
-        printf("upd %zu\n", i);
-        update_global_state(i + 2, (i + 2) * 2);
-        usleep(500000);
+    for (size_t i = 0; i < 100000; i++) {
+        update_global_state(i + 1);
+        usleep(UPDATE_INTERVAL_US);
     }
 
     atomic_store_explicit(&should_exit, true, memory_order_relaxed);
@@ -98,6 +97,8 @@ int main(void) {
     for (size_t i = 0; i < WORKER_COUNT; i++) {
         thrd_join(workers[i], NULL);
     }
+
+    puts("stresstest complete");
 
     rcu_thread_offline();
 
