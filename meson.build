@@ -1,4 +1,4 @@
-project('rcutest', 'c', default_options: ['c_std=c11'])
+project('rcutest', 'c', default_options: ['c_std=gnu11'])
 
 defines = [
     '-DWORKER_COUNT=' + get_option('worker_count').to_string(),
