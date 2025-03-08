@@ -37,26 +37,29 @@ void rcu_read_unlock_report_qs(void) {
     if (!atomic_exchange_explicit(&rcu_thread_state.need_qs, false,
                                   memory_order_relaxed)) {
         // The initiator has already noticed we were quiescent: it is
-        // responsible for executing the memory barrier on this thread, and will
-        // do so by means of asymmetric barrier F.
+        // responsible for synchronizing with this reader, and will do so by
+        // means of asymmetric fence G.
         return;
     }
 
-    // We've cleared `need_qs` ourselves, so we're responsible for issuing a
-    // full memory barrier on the owning thread (us!). `synchronize_rcu` issues
-    // an asymmetric barrier (E) itself after setting `need_qs`, but that
-    // barrier might hit us too early (in the middle of the critical section).
-    // Formally, E might precede lightweight barriers B and C in the global
-    // SC order, while we want something that precedes the end of the grace
-    // period in that order.
+    // We've cleared `need_qs` ourselves, so we're responsible for ensuring some
+    // kind of synchronization with the end of the grace period.
+    // `synchronize_rcu` issues an asymmetric fence (F) itself after setting
+    // `need_qs`, but that fence might hit us too early (in the middle of the
+    // critical section). Formally, F might precede lightweight barriers B and C
+    // in the global SC order, while we want the end of the reader to precede
+    // the end of the grace period.
 
-    // This barrier also synchronizes-with the release store to `need_qs` and
-    // ensures we observe at least the initial state of `gp_holdouts` at the
-    // start of the grace period.
-
-    // Barrier D: Pairs with G in `synchronize_rcu`, synchronizes-with R in
-    // `synchronize_rcu`.
-    atomic_thread_fence(memory_order_seq_cst);
+    // Fence D: Synchronizes-with E and H.
+    //
+    // * Synchronization with E occurs via the RMW of `need_qs` above, and
+    //   ensures we observe at least the initial state of `gp_holdouts` at the
+    //   start of the grace period.
+    //
+    // * Synchronization with H occurs via the RMW to `gp_holdouts` (either
+    //   because of a direct read or as part of a release sequence), and ensures
+    //   that we happen-before the end of the grace period.
+    atomic_thread_fence(memory_order_acq_rel);
 
     if (atomic_fetch_sub_explicit(&global_state.gp_holdouts, 1,
                                   memory_order_relaxed) == 1) {
@@ -101,6 +104,52 @@ void rcu_thread_offline(void) {
 }
 
 void synchronize_rcu(void) {
+    // clang-format off
+    //
+    // Every grace period G must ensure the following:
+    //
+    // 1. An SC fence is issued at some point during G.
+    //
+    // 2. For every reader R, at least one of the following holds:
+    //
+    //     i. The start of G happens-before the start of R after an SC fence has
+    //        been issued on the thread performing G.
+    //
+    //    ii. The end of R happens-before the end of G, after which an SC fence
+    //        is issued on the thread performing G.
+    //
+    // For most typical RCU applications, the happens-before relationships with
+    // readers are sufficient.
+    //
+    // The SC fences start to matter when combining RCU external SC operations.
+    // For example, the following store buffering scenario:
+    //
+    //     store_relaxed(&x, 1);  || store_relaxed(&y, 1);
+    //     synchronize_rcu();     || fence_seq_cst();
+    //     load_relaxed(&y); // 0 || load_relaxed(&x); // 0
+    //
+    // is forbidden by condition 1.
+    //
+    // Similarly, the more complex store buffering cycle here:
+    //
+    //     store_relaxed(&x, 1);  || rcu_read_lock();       || rcu_read_lock();
+    //     synchronize_rcu();     || store_relaxed(&y, 1);  || store_relaxed(&z, 1);
+    //     load_relaxed(&y); // 0 || load_relaxed(&z); // 0 || fence_seq_cst();
+    //                            || rcu_read_unlock();     || load_relaxed(&x); // 0
+    //                            ||                        || rcu_read_unlock();
+    //
+    // is prevented by the SC fence requirement in condition 2.i.
+    //
+    // Analogously, the SC fence requirement in condition 2.ii prevents this:
+    //
+    //     store_relaxed(&x, 1);  || rcu_read_lock();       || rcu_read_lock();
+    //     synchronize_rcu();     || store_relaxed(&y, 1);  || store_relaxed(&z, 1);
+    //     load_relaxed(&y); // 0 || fence_seq_cst();       || load_relaxed(&x); // 0
+    //                            || load_relaxed(&z); // 0 || rcu_read_unlock();
+    //                            || rcu_read_unlock();     ||
+    //
+    // clang-format on
+
     uint32_t thread_count = 0;
     uint32_t quiescent = 0;
 
@@ -111,7 +160,7 @@ void synchronize_rcu(void) {
     atomic_store_explicit(&global_state.gp_holdouts, thread_count,
                           memory_order_relaxed);
 
-    // Barrier R: Synchronizes-with D.
+    // Fence E: Synchronizes-with D via the writes to `need_qs` below.
     // Ensures that readers reporting themselves as quiescent observe a
     // `gp_holdouts` from the current grace period.
     atomic_thread_fence(memory_order_release);
@@ -121,17 +170,21 @@ void synchronize_rcu(void) {
         atomic_store_explicit(&thread->need_qs, true, memory_order_relaxed);
     }
 
-    // Barrier E: Pairs with A and C.
+    // Fence F: Pairs with A and C, upholds requirements 1 and 2.i above.
     //
     // * The pairing with A ensures that if our read of `read_lock_nesting`
-    //   reads-before a particular `rcu_read_lock`, that `rcu_read_lock` will
-    //   observe all accesses preceding the grace period.
+    //   reads-before a particular `rcu_read_lock`, everything preceding the
+    //   grace period will happen-before that `rcu_read_lock`.
     //
     // * The pairing with C prevents store buffering and makes sure that for
     //   every top-level read-side critical section exited, either we'll observe
     //   the store to `read_lock_nesting` preceding C in the loop below, or that
     //   `rcu_read_unlock` will observe our store to `need_qs` in the loop
     //   above.
+    //
+    // * The SC fence performed on the current thread by this function upholds
+    //   requirement 1 for this grace period, as well as the SC-fence portion
+    //   of 2.i for any readers it happens-before.
     asymm_fence_seq_cst_heavy();
 
     for (struct rcu_thread_state* thread = global_state.thread_head; thread;
@@ -141,7 +194,7 @@ void synchronize_rcu(void) {
             if (atomic_exchange_explicit(&thread->need_qs, false,
                                          memory_order_relaxed)) {
                 // This thread is quiescent, and we now claim responsibility for
-                // reporting that (see barrier F below for memory ordering
+                // reporting that (see fence G below for memory ordering
                 // guarantees).
                 quiescent++;
             }
@@ -151,11 +204,17 @@ void synchronize_rcu(void) {
     if (quiescent > 0) {
         // Self-report any threads we've noticed are quiescent.
 
-        // Barrier F: Pairs with B.
-        // Ensures that if we observe a `read_lock_nesting` of 0 above and
-        // manage to claim responsibility for marking a given thread as
-        // quiescent, we will also observe any accesses inside the read-side
-        // critical section.
+        // Fence G: Pairs with B, upholds the SC-fence portion of
+        // requirement 2.ii above.
+        //
+        // * The pairing with B ensures that if we observe a `read_lock_nesting`
+        //   of 0 above and manage to claim responsibility for marking a given
+        //   thread as quiescent, we will also observe any accesses inside the
+        //   read-side critical section.
+        //
+        // * The SC fence performed on the current thread before the function
+        //   returns upholds the SC-fence portion of requirement 2.ii for any
+        //   readers with which it has synchronized.
 
         asymm_fence_seq_cst_heavy();
         atomic_fetch_sub_explicit(&global_state.gp_holdouts, quiescent,
@@ -164,9 +223,8 @@ void synchronize_rcu(void) {
 
     if (quiescent != thread_count) {
         // If we haven't reported all online threads as quiescent ourselves, we
-        // need to wait for at least one to report itself via
-        // `rcu_read_unlock_report_qs` and execute a matching memory barrier
-        // when it does.
+        // need to wait until the last one reports itself via
+        // `rcu_read_unlock_report_qs` and then perform an SC fence.
 
         for (;;) {
             uint32_t holdouts = atomic_load_explicit(&global_state.gp_holdouts,
@@ -177,7 +235,15 @@ void synchronize_rcu(void) {
             futex_wait(&global_state.gp_holdouts, holdouts);
         }
 
-        // Barrier G: Pairs with D in `rcu_read_unlock_report_qs`.
+        // Fence H: Synchronizes-with with D, ensures we perform an SC fence
+        // as per requirement 2.ii above.
+        //
+        // * The synchronization with D that happens via our read of
+        //   `gp_holdouts` and ensures the ends of the readers we were waiting
+        //   for happen-before the end of the grace period.
+        //
+        // * The fence is an SC one (as opposed to acquire) to uphold
+        //   rquirement 2.ii.
         atomic_thread_fence(memory_order_seq_cst);
     }
 
