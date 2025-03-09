@@ -19,7 +19,6 @@ _Atomic(uint64_t*) global_shared_state;
 thread_local uint64_t iterations;
 
 int worker_func(void* arg) {
-    uint64_t* state;
     uint64_t value;
     int i = (int) (intptr_t) arg;
 
@@ -29,10 +28,9 @@ int worker_func(void* arg) {
         rcu_read_lock();
 
         // NOTE: This is actually a consume load, and we just "know" the
-        // compiler won't break the dependency here.
-        state =
-            atomic_load_explicit(&global_shared_state, memory_order_relaxed);
-        value = *state;
+        // compiler won't break the dependency to the immediate load here.
+        value =
+            *atomic_load_explicit(&global_shared_state, memory_order_relaxed);
 
         if (value == UINT64_MAX) {
             abort();
@@ -50,15 +48,14 @@ int worker_func(void* arg) {
     return 0;
 }
 
-void update_global_state(uint64_t n) {
-    uint64_t* old_state =
-        atomic_load_explicit(&global_shared_state, memory_order_relaxed);
+void update_global_state(void) {
+    uint64_t* old_state = NULL;
 
     uint64_t* new_state = malloc(sizeof(*new_state));
-    *new_state = n;
+    *new_state = 5;
 
-    atomic_store_explicit(&global_shared_state, new_state,
-                          memory_order_release);
+    old_state = atomic_exchange_explicit(&global_shared_state, new_state,
+                                         memory_order_release);
 
     if (old_state) {
         synchronize_rcu();
@@ -66,8 +63,17 @@ void update_global_state(uint64_t n) {
     }
 }
 
+int updater_func(void* arg) {
+    while (!atomic_load_explicit(&should_exit, memory_order_relaxed)) {
+        update_global_state();
+        usleep(UPDATE_INTERVAL_US);
+    }
+    return 0;
+}
+
 int main(void) {
     thrd_t workers[WORKER_COUNT];
+    thrd_t updater;
 
     if (rcu_init() != 0) {
         return 1;
@@ -75,7 +81,7 @@ int main(void) {
 
     rcu_thread_online();
 
-    update_global_state(1);
+    update_global_state();
 
     printf("starting stresstest with %d workers, update interval %dμs\n",
            WORKER_COUNT, UPDATE_INTERVAL_US);
@@ -90,16 +96,19 @@ int main(void) {
         }
     }
 
-    for (size_t i = 0; i < 100000; i++) {
-        update_global_state(i + 1);
-        usleep(UPDATE_INTERVAL_US);
+    if (thrd_create(&updater, updater_func, NULL) != thrd_success) {
+        return 1;
     }
+
+    usleep(5000000);
 
     atomic_store_explicit(&should_exit, true, memory_order_relaxed);
 
     for (size_t i = 0; i < WORKER_COUNT; i++) {
         thrd_join(workers[i], NULL);
     }
+
+    thrd_join(updater, NULL);
 
     struct timespec end;
     clock_gettime(CLOCK_MONOTONIC, &end);
