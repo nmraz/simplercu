@@ -21,7 +21,7 @@ thread_local uint64_t iterations;
 unsigned update_interval_us;
 unsigned test_time_ms;
 
-int worker_func(void* arg) {
+int reader_func(void* arg) {
     uint64_t value;
     int i = (int) (intptr_t) arg;
 
@@ -44,7 +44,7 @@ int worker_func(void* arg) {
         rcu_read_unlock();
     }
 
-    printf("thread %d: %lu iterations\n", i, iterations);
+    printf("reader %d: %lu iterations\n", i, iterations);
 
     rcu_thread_offline();
 
@@ -104,7 +104,7 @@ bool parse_opts(int argc, char* argv[]) {
 }
 
 int main(int argc, char* argv[]) {
-    thrd_t workers[WORKER_COUNT];
+    thrd_t readers[READER_COUNT];
     thrd_t updater;
 
     if (!parse_opts(argc, argv)) {
@@ -122,14 +122,14 @@ int main(int argc, char* argv[]) {
     update_global_state();
 
     printf(
-        "starting stresstest with %d workers for %ums, update interval %dμs\n",
-        WORKER_COUNT, test_time_ms, update_interval_us);
+        "starting stresstest with %d readers for %ums, update interval %dμs\n",
+        READER_COUNT, test_time_ms, update_interval_us);
 
     struct timespec start;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
-    for (size_t i = 0; i < WORKER_COUNT; i++) {
-        if (thrd_create(&workers[i], worker_func, (void*) (intptr_t) i) !=
+    for (size_t i = 0; i < READER_COUNT; i++) {
+        if (thrd_create(&readers[i], reader_func, (void*) (intptr_t) i) !=
             thrd_success) {
             return 1;
         }
@@ -143,8 +143,8 @@ int main(int argc, char* argv[]) {
 
     atomic_store_explicit(&should_exit, true, memory_order_relaxed);
 
-    for (size_t i = 0; i < WORKER_COUNT; i++) {
-        thrd_join(workers[i], NULL);
+    for (size_t i = 0; i < READER_COUNT; i++) {
+        thrd_join(readers[i], NULL);
     }
 
     thrd_join(updater, NULL);

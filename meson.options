@@ -1,2 +1,2 @@
-option('worker_count', type: 'integer', min: 1, value: 10)
+option('reader_count', type: 'integer', min: 1, value: 10)
 option('test_store_buffering', type: 'boolean')
