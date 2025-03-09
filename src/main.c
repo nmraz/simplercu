@@ -14,6 +14,7 @@
 #include "rcu.h"
 
 #define MAX_READERS 64
+#define MAX_UPDATERS 64
 
 atomic_bool should_exit;
 _Atomic(uint64_t*) global_shared_state;
@@ -21,6 +22,7 @@ _Atomic(uint64_t*) global_shared_state;
 thread_local uint64_t iterations;
 
 unsigned reader_count;
+unsigned updater_count;
 unsigned update_interval_us;
 unsigned test_time_ms;
 
@@ -70,20 +72,29 @@ void update_global_state(void) {
 }
 
 int updater_func(void* arg) {
+    int i = (int) (intptr_t) arg;
+
     while (!atomic_load_explicit(&should_exit, memory_order_relaxed)) {
+        iterations++;
         update_global_state();
         usleep(update_interval_us);
     }
+
+    printf("updater %d: %lu iterations\n", i, iterations);
+
     return 0;
 }
 
 bool parse_opts(int argc, char* argv[]) {
     int opt;
 
-    while ((opt = getopt(argc, argv, "r:t:i:")) != -1) {
+    while ((opt = getopt(argc, argv, "r:u:t:i:")) != -1) {
         switch (opt) {
         case 'r':
             reader_count = atoi(optarg);
+            break;
+        case 'u':
+            updater_count = atoi(optarg);
             break;
         case 't':
             test_time_ms = atoi(optarg);
@@ -112,16 +123,23 @@ bool parse_opts(int argc, char* argv[]) {
         return false;
     }
 
+    if (updater_count == 0 || updater_count > MAX_UPDATERS) {
+        fprintf(stderr, "%s: updater count must be between 1 and %u\n", argv[0],
+                MAX_UPDATERS);
+        return false;
+    }
+
     return true;
 }
 
 int main(int argc, char* argv[]) {
     thrd_t readers[MAX_READERS];
-    thrd_t updater;
+    thrd_t updaters[MAX_UPDATERS];
 
     if (!parse_opts(argc, argv)) {
         fprintf(stderr,
-                "usage: %s -r <reader_count>  -t <test_time_ms> -i "
+                "usage: %s -r <reader_count> -u <updater_count>  -t "
+                "<test_time_ms> -i "
                 "<update_interval_us>\n",
                 argv[0]);
         return 1;
@@ -131,13 +149,11 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    rcu_thread_online();
-
     update_global_state();
 
-    printf(
-        "starting stresstest with %d readers for %ums, update interval %dμs\n",
-        reader_count, test_time_ms, update_interval_us);
+    printf("starting stresstest with %d readers and %d updaters for %ums, "
+           "update interval %dμs\n",
+           reader_count, updater_count, test_time_ms, update_interval_us);
 
     struct timespec start;
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -149,8 +165,11 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    if (thrd_create(&updater, updater_func, NULL) != thrd_success) {
-        return 1;
+    for (size_t i = 0; i < updater_count; i++) {
+        if (thrd_create(&updaters[i], updater_func, (void*) (intptr_t) i) !=
+            thrd_success) {
+            return 1;
+        }
     }
 
     usleep(test_time_ms * 1000);
@@ -161,7 +180,9 @@ int main(int argc, char* argv[]) {
         thrd_join(readers[i], NULL);
     }
 
-    thrd_join(updater, NULL);
+    for (size_t i = 0; i < updater_count; i++) {
+        thrd_join(updaters[i], NULL);
+    }
 
     struct timespec end;
     clock_gettime(CLOCK_MONOTONIC, &end);
@@ -171,8 +192,6 @@ int main(int argc, char* argv[]) {
 
     printf("stresstest complete in %lu.%02lus\n", elapsed_us / 1000000,
            (elapsed_us % 1000000) / 10000);
-
-    rcu_thread_offline();
 
     return 0;
 }
