@@ -18,6 +18,9 @@ _Atomic(uint64_t*) global_shared_state;
 
 thread_local uint64_t iterations;
 
+unsigned update_interval_us;
+unsigned test_time_ms;
+
 int worker_func(void* arg) {
     uint64_t value;
     int i = (int) (intptr_t) arg;
@@ -66,14 +69,49 @@ void update_global_state(void) {
 int updater_func(void* arg) {
     while (!atomic_load_explicit(&should_exit, memory_order_relaxed)) {
         update_global_state();
-        usleep(UPDATE_INTERVAL_US);
+        usleep(update_interval_us);
     }
     return 0;
 }
 
-int main(void) {
+bool parse_opts(int argc, char* argv[]) {
+    int opt;
+
+    while ((opt = getopt(argc, argv, "t:i:")) != -1) {
+        switch (opt) {
+        case 't':
+            test_time_ms = atoi(optarg);
+            break;
+        case 'i':
+            update_interval_us = atoi(optarg);
+            break;
+        default:
+            return false;
+        }
+    }
+
+    if (test_time_ms == 0) {
+        fprintf(stderr, "%s: test duration must be specified\n", argv[0]);
+        return false;
+    }
+
+    if (update_interval_us == 0) {
+        fprintf(stderr, "%s: udpate interval must be specified\n", argv[0]);
+        return false;
+    }
+
+    return true;
+}
+
+int main(int argc, char* argv[]) {
     thrd_t workers[WORKER_COUNT];
     thrd_t updater;
+
+    if (!parse_opts(argc, argv)) {
+        fprintf(stderr, "usage: %s -t <test_time_ms> -i <update_interval_us>\n",
+                argv[0]);
+        return 1;
+    }
 
     if (rcu_init() != 0) {
         return 1;
@@ -83,8 +121,9 @@ int main(void) {
 
     update_global_state();
 
-    printf("starting stresstest with %d workers, update interval %dμs\n",
-           WORKER_COUNT, UPDATE_INTERVAL_US);
+    printf(
+        "starting stresstest with %d workers for %ums, update interval %dμs\n",
+        WORKER_COUNT, test_time_ms, update_interval_us);
 
     struct timespec start;
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -100,7 +139,7 @@ int main(void) {
         return 1;
     }
 
-    usleep(5000000);
+    usleep(test_time_ms * 1000);
 
     atomic_store_explicit(&should_exit, true, memory_order_relaxed);
 
