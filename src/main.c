@@ -13,11 +13,14 @@
 
 #include "rcu.h"
 
+#define MAX_READERS 64
+
 atomic_bool should_exit;
 _Atomic(uint64_t*) global_shared_state;
 
 thread_local uint64_t iterations;
 
+unsigned reader_count;
 unsigned update_interval_us;
 unsigned test_time_ms;
 
@@ -77,8 +80,11 @@ int updater_func(void* arg) {
 bool parse_opts(int argc, char* argv[]) {
     int opt;
 
-    while ((opt = getopt(argc, argv, "t:i:")) != -1) {
+    while ((opt = getopt(argc, argv, "r:t:i:")) != -1) {
         switch (opt) {
+        case 'r':
+            reader_count = atoi(optarg);
+            break;
         case 't':
             test_time_ms = atoi(optarg);
             break;
@@ -100,15 +106,23 @@ bool parse_opts(int argc, char* argv[]) {
         return false;
     }
 
+    if (reader_count == 0 || reader_count > MAX_READERS) {
+        fprintf(stderr, "%s: reader count must be between 1 and %u\n", argv[0],
+                MAX_READERS);
+        return false;
+    }
+
     return true;
 }
 
 int main(int argc, char* argv[]) {
-    thrd_t readers[READER_COUNT];
+    thrd_t readers[MAX_READERS];
     thrd_t updater;
 
     if (!parse_opts(argc, argv)) {
-        fprintf(stderr, "usage: %s -t <test_time_ms> -i <update_interval_us>\n",
+        fprintf(stderr,
+                "usage: %s -r <reader_count>  -t <test_time_ms> -i "
+                "<update_interval_us>\n",
                 argv[0]);
         return 1;
     }
@@ -123,12 +137,12 @@ int main(int argc, char* argv[]) {
 
     printf(
         "starting stresstest with %d readers for %ums, update interval %dμs\n",
-        READER_COUNT, test_time_ms, update_interval_us);
+        reader_count, test_time_ms, update_interval_us);
 
     struct timespec start;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
-    for (size_t i = 0; i < READER_COUNT; i++) {
+    for (size_t i = 0; i < reader_count; i++) {
         if (thrd_create(&readers[i], reader_func, (void*) (intptr_t) i) !=
             thrd_success) {
             return 1;
@@ -143,7 +157,7 @@ int main(int argc, char* argv[]) {
 
     atomic_store_explicit(&should_exit, true, memory_order_relaxed);
 
-    for (size_t i = 0; i < READER_COUNT; i++) {
+    for (size_t i = 0; i < reader_count; i++) {
         thrd_join(readers[i], NULL);
     }
 
